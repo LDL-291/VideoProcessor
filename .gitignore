@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# PyInstaller build output
+build/
+dist/
+
+# Never commit a real ffmpeg build (licensing, size) or local settings/temp
+ffmpeg/

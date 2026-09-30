@@ -75,6 +75,83 @@ PRESET_DESCRIPTIONS: dict[Preset, str] = {
 }
 
 
+class CropMode(str, Enum):
+    NONE = "none"
+    MARGINS = "margins"    # trim a fixed number of pixels off each edge
+    ASPECT = "aspect"      # largest centered region with a given aspect ratio
+
+
+@dataclass(frozen=True)
+class CropSpec:
+    mode: CropMode = CropMode.NONE
+    left: int = 0
+    top: int = 0
+    right: int = 0
+    bottom: int = 0
+    aspect_w: int = 9
+    aspect_h: int = 16
+
+    @property
+    def active(self) -> bool:
+        if self.mode == CropMode.MARGINS:
+            return any((self.left, self.top, self.right, self.bottom))
+        return self.mode == CropMode.ASPECT
+
+
+# (width, height, x, y) in source pixels
+CropRect = tuple[int, int, int, int]
+
+
+def compute_crop(info: MediaInfo, spec: CropSpec) -> CropRect | None:
+    """Resolve `spec` against one source's dimensions.
+
+    Returns None when no crop applies. Sizes and offsets are rounded to even
+    numbers so yuv420 chroma stays aligned. Raises ValueError when the
+    request can't be satisfied for this source (e.g. margins exceed its size).
+    """
+    if not spec.active:
+        return None
+    if not info.width or not info.height:
+        raise ValueError("Source dimensions are unknown; can't crop.")
+    src_w, src_h = info.width, info.height
+
+    if spec.mode == CropMode.MARGINS:
+        if min(spec.left, spec.top, spec.right, spec.bottom) < 0:
+            raise ValueError("Crop margins can't be negative.")
+        x = spec.left - spec.left % 2
+        y = spec.top - spec.top % 2
+        w = src_w - x - spec.right
+        h = src_h - y - spec.bottom
+        w -= w % 2
+        h -= h % 2
+    else:
+        if spec.aspect_w <= 0 or spec.aspect_h <= 0:
+            raise ValueError("Crop aspect ratio must be positive.")
+        if src_w * spec.aspect_h > src_h * spec.aspect_w:
+            h = src_h
+            w = h * spec.aspect_w // spec.aspect_h
+        else:
+            w = src_w
+            h = w * spec.aspect_h // spec.aspect_w
+        w -= w % 2
+        h -= h % 2
+        x = (src_w - w) // 2
+        y = (src_h - h) // 2
+        x -= x % 2
+        y -= y % 2
+
+    if w < 2 or h < 2 or x + w > src_w or y + h > src_h:
+        raise ValueError(f"Crop doesn't fit a {src_w}x{src_h} source.")
+    if (w, h, x, y) == (src_w, src_h, 0, 0):
+        return None
+    return w, h, x, y
+
+
+def crop_filter(rect: CropRect) -> str:
+    w, h, x, y = rect
+    return f"crop={w}:{h}:{x}:{y}"
+
+
 @dataclass
 class Plan:
     action: Action
@@ -84,6 +161,7 @@ class Plan:
     args: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     crf: int | None = None
+    crop_rect: CropRect | None = None
 
 
 def temp_output_path(final_path: Path) -> Path:
@@ -139,6 +217,7 @@ def build_plan(
     force_reencode_h264: bool = False,
     reserved_paths: set[Path] | None = None,
     crf_override: int | None = None,
+    crop: CropSpec | None = None,
 ) -> Plan:
     """Build a Plan for one source file.
 
@@ -149,6 +228,9 @@ def build_plan(
 
     `crf_override` replaces the preset's CRF (used by the verification
     pipeline's auto-retry at a lower CRF); it has no effect on the GPU preset.
+
+    `crop` forces a re-encode (a stream copy can't crop); the resolved
+    rectangle is recorded on the Plan so verification can account for it.
     """
     warnings: list[str] = []
     config = PRESET_CONFIGS[preset]
@@ -167,6 +249,14 @@ def build_plan(
             warnings=["Output directory equals source directory and no suffix is set."],
         )
 
+    try:
+        crop_rect = compute_crop(info, crop) if crop is not None else None
+    except ValueError as exc:
+        return Plan(
+            action=Action.REFUSE, input_path=info.path, output_path=None,
+            warnings=[str(exc)],
+        )
+
     output_path = _resolve_output_path(
         info, output_dir, source_root, suffix, overwrite_policy, reserved_paths
     )
@@ -182,7 +272,7 @@ def build_plan(
         info.video_codec == "h264"
         and "mp4" in (info.container or "").lower()
     )
-    if already_h264_mp4 and not force_reencode_h264:
+    if already_h264_mp4 and not force_reencode_h264 and crop_rect is None:
         return Plan(
             action=Action.COPY,
             input_path=info.path,
@@ -190,7 +280,7 @@ def build_plan(
             tmp_output_path=tmp_path,
             args=_build_copy_args(info, tmp_path),
         )
-    if already_h264_mp4 and force_reencode_h264:
+    if already_h264_mp4 and (force_reencode_h264 or crop_rect is not None):
         warnings.append("Re-encoding an already-H.264 source causes generation loss.")
 
     # Issue 3: HDR sources need explicit tonemap opt-in; skip by default.
@@ -200,7 +290,7 @@ def build_plan(
             "metadata as-is; no tonemap was requested."
         )
 
-    args = _build_encode_args(info, config, tmp_path, audio_mode, warnings)
+    args = _build_encode_args(info, config, tmp_path, audio_mode, warnings, crop_rect)
 
     return Plan(
         action=Action.ENCODE,
@@ -210,6 +300,7 @@ def build_plan(
         args=args,
         warnings=warnings,
         crf=config.crf if not config.use_gpu else None,
+        crop_rect=crop_rect,
     )
 
 
@@ -230,6 +321,7 @@ def _build_encode_args(
     tmp_output_path: Path,
     audio_mode: str,
     warnings: list[str],
+    crop_rect: CropRect | None = None,
 ) -> list[str]:
     args: list[str] = ["-i", str(info.path)]
 
@@ -261,8 +353,14 @@ def _build_encode_args(
     if pix_fmt:
         args += ["-pix_fmt", pix_fmt]
 
+    if crop_rect is not None:
+        # compute_crop() always yields even dimensions, so no odd-size pad.
+        args += ["-vf", crop_filter(crop_rect)]
+        warnings.append(
+            f"Cropped {info.width}x{info.height} -> {crop_rect[0]}x{crop_rect[1]}."
+        )
     # Issue 9: odd dimensions crash libx264 with yuv420p; pad by 1px.
-    if info.is_odd_dimensions:
+    elif info.is_odd_dimensions:
         args += ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
         warnings.append(
             f"Source has odd dimensions ({info.width}x{info.height}); padded to even."

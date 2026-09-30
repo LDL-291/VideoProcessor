@@ -71,7 +71,13 @@ class VerificationResult:
 # Structural checks (pure)
 # --------------------------------------------------------------------------
 
-def check_structural(source: MediaInfo, output: MediaInfo) -> StructuralResult:
+def check_structural(
+    source: MediaInfo,
+    output: MediaInfo,
+    expected_size: tuple[int, int] | None = None,
+) -> StructuralResult:
+    """`expected_size` is the (width, height) the output should have when the
+    plan deliberately changes it (e.g. cropping); defaults to the source's."""
     issues: list[str] = []
 
     if abs(source.duration_s - output.duration_s) > DURATION_TOLERANCE_S:
@@ -80,10 +86,16 @@ def check_structural(source: MediaInfo, output: MediaInfo) -> StructuralResult:
             f"(tolerance {DURATION_TOLERANCE_S}s)."
         )
 
-    if (source.width, source.height) != (output.width, output.height):
+    if expected_size is None:
+        if (source.width, source.height) != (output.width, output.height):
+            issues.append(
+                f"Resolution changed: {source.width}x{source.height} -> "
+                f"{output.width}x{output.height}."
+            )
+    elif expected_size != (output.width, output.height):
         issues.append(
-            f"Resolution changed: {source.width}x{source.height} -> "
-            f"{output.width}x{output.height}."
+            f"Resolution is {output.width}x{output.height}, "
+            f"expected {expected_size[0]}x{expected_size[1]} after cropping."
         )
 
     source_frames = _expected_frame_count(source)
@@ -235,8 +247,12 @@ def run_quality_check(
     duration_s: float,
     ffmpeg_path: str = "ffmpeg",
     use_vmaf: bool | None = None,
+    crop_rect: tuple[int, int, int, int] | None = None,
 ) -> QualityScore:
-    """Score `output_path` against `source_path`, sampling per compute_sample_windows."""
+    """Score `output_path` against `source_path`, sampling per compute_sample_windows.
+
+    `crop_rect` (w, h, x, y) is applied to the source so both sides cover the
+    same region when the output was cropped."""
     if use_vmaf is None:
         use_vmaf = has_libvmaf(ffmpeg_path)
 
@@ -246,9 +262,9 @@ def run_quality_check(
     scores: list[QualityScore] = []
     for window in samples:
         if use_vmaf:
-            scores.append(_run_vmaf_sample(source_path, output_path, window, ffmpeg_path))
+            scores.append(_run_vmaf_sample(source_path, output_path, window, ffmpeg_path, crop_rect))
         else:
-            scores.append(_run_ssim_sample(source_path, output_path, window, ffmpeg_path))
+            scores.append(_run_ssim_sample(source_path, output_path, window, ffmpeg_path, crop_rect))
 
     return _average_scores(scores)
 
@@ -262,8 +278,17 @@ def _average_scores(scores: list[QualityScore]) -> QualityScore:
     )
 
 
+def _reference_chain(crop_rect: tuple[int, int, int, int] | None) -> str:
+    """Filter-graph prefix producing the [ref] stream from the source input."""
+    if crop_rect is None:
+        return "[1:v]null[ref];"
+    w, h, x, y = crop_rect
+    return f"[1:v]crop={w}:{h}:{x}:{y}[ref];"
+
+
 def _run_vmaf_sample(
-    source_path: Path, output_path: Path, window: tuple[float, float] | None, ffmpeg_path: str
+    source_path: Path, output_path: Path, window: tuple[float, float] | None, ffmpeg_path: str,
+    crop_rect: tuple[int, int, int, int] | None = None,
 ) -> QualityScore:
     with tempfile.TemporaryDirectory(dir=get_temp_root()) as tmp_dir:
         log_name = "vmaf.json"
@@ -278,7 +303,7 @@ def _run_vmaf_sample(
             *_trim_args(window), "-i", str(Path(output_path).resolve()),
             *_trim_args(window), "-i", str(Path(source_path).resolve()),
             "-filter_complex",
-            f"[0:v][1:v]libvmaf=log_fmt=json:log_path={log_name}",
+            f"{_reference_chain(crop_rect)}[0:v][ref]libvmaf=log_fmt=json:log_path={log_name}",
             "-f", "null", "-",
         ]
         subprocess.run(args, capture_output=True, check=True, cwd=tmp_dir, **_subprocess_kwargs())
@@ -287,13 +312,14 @@ def _run_vmaf_sample(
 
 
 def _run_ssim_sample(
-    source_path: Path, output_path: Path, window: tuple[float, float] | None, ffmpeg_path: str
+    source_path: Path, output_path: Path, window: tuple[float, float] | None, ffmpeg_path: str,
+    crop_rect: tuple[int, int, int, int] | None = None,
 ) -> QualityScore:
     args = [
         ffmpeg_path, "-hide_banner", "-nostats",
         *_trim_args(window), "-i", str(output_path),
         *_trim_args(window), "-i", str(source_path),
-        "-filter_complex", "[0:v][1:v]ssim",
+        "-filter_complex", f"{_reference_chain(crop_rect)}[0:v][ref]ssim",
         "-f", "null", "-",
     ]
     result = subprocess.run(

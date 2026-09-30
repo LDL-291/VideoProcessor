@@ -324,6 +324,7 @@ class MainWindow(QMainWindow):
             verify_quality=self.settings.verify_quality,
             crf_override=self.settings.crf_override,
             suffix=self.settings.suffix,
+            crop=self.settings.crop_spec(),
             ffmpeg_path=self.ffmpeg_path,
             ffprobe_path=self.ffprobe_path,
         )

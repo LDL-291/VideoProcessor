@@ -28,6 +28,7 @@ class RunnerConfig:
     audio_mode: str = "auto"
     verify_quality: bool = True
     crf_override: int | None = None
+    crop: planner.CropSpec | None = None
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
 
@@ -66,6 +67,7 @@ def run_job(
                 audio_mode=config.audio_mode,
                 reserved_paths=reserved_paths,
                 crf_override=config.crf_override,
+                crop=config.crop,
             )
 
         job.warnings = list(plan.warnings)
@@ -126,7 +128,8 @@ def _encode_verify_loop(
 
         job.set_state(JobState.VERIFYING)
         output_info = probe_fn(current_plan.tmp_output_path, config.ffprobe_path)
-        structural = verify.check_structural(source_info, output_info)
+        expected_size = current_plan.crop_rect[:2] if current_plan.crop_rect else None
+        structural = verify.check_structural(source_info, output_info, expected_size)
 
         if not structural.passed:
             job.warnings += structural.issues
@@ -144,7 +147,7 @@ def _encode_verify_loop(
 
         quality = verify.run_quality_check(
             source_info.path, current_plan.tmp_output_path, source_info.duration_s,
-            config.ffmpeg_path,
+            config.ffmpeg_path, crop_rect=current_plan.crop_rect,
         )
         job.quality = quality
 
@@ -170,7 +173,7 @@ def _encode_verify_loop(
             source_info, config.preset, config.output_dir,
             source_root=config.source_root, suffix=config.suffix,
             overwrite_policy=config.overwrite_policy, audio_mode=config.audio_mode,
-            crf_override=retry_crf,
+            crf_override=retry_crf, crop=config.crop,
         )
 
 

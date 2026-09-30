@@ -82,3 +82,23 @@ def test_explicit_crf_override_is_preserved_on_load(qapp):
 
     assert panel.crf_override_spin.value() == 5
     assert panel.get_settings().crf_override == 5
+
+
+def test_crop_settings_roundtrip_and_enable_state(qapp):
+    panel = SettingsPanel(AppSettings())
+    assert not panel.crop_aspect_combo.isEnabled()
+    assert not panel.crop_margin_spins["left"].isEnabled()
+
+    original = AppSettings(crop_mode="margins", crop_left=12, crop_bottom=40)
+    panel.set_settings(original)
+    assert panel.crop_margin_spins["left"].isEnabled()
+    assert panel.get_settings().crop_left == 12 and panel.get_settings().crop_bottom == 40
+
+    custom = AppSettings(crop_mode="aspect", crop_aspect_w=3, crop_aspect_h=4)
+    panel.set_settings(custom)
+    assert panel.crop_aspect_w_spin.isEnabled()
+    result = panel.get_settings()
+    assert (result.crop_mode, result.crop_aspect_w, result.crop_aspect_h) == ("aspect", 3, 4)
+
+    panel.set_settings(AppSettings(crop_mode="aspect", crop_aspect_w=9, crop_aspect_h=16))
+    assert not panel.crop_aspect_w_spin.isEnabled()

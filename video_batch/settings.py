@@ -11,13 +11,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from video_batch.core.paths import get_config_dir
-from video_batch.core.planner import OverwritePolicy, Preset
+from video_batch.core.planner import CropMode, CropSpec, OverwritePolicy, Preset
 
 SETTINGS_FILENAME = "settings.json"
 
 MIN_CRF, MAX_CRF = 0, 51
 MIN_PARALLEL_JOBS, MAX_PARALLEL_JOBS = 1, 8
 VALID_AUDIO_MODES = {"auto", "copy", "reencode"}
+MAX_CROP_MARGIN = 10000
+MAX_ASPECT_TERM = 100
 
 
 @dataclass
@@ -30,6 +32,24 @@ class AppSettings:
     verify_quality: bool = True
     suffix: str = ""
     output_dir: str | None = None
+    crop_mode: str = CropMode.NONE.value
+    crop_left: int = 0
+    crop_top: int = 0
+    crop_right: int = 0
+    crop_bottom: int = 0
+    crop_aspect_w: int = 9
+    crop_aspect_h: int = 16
+
+    def crop_spec(self) -> CropSpec:
+        return CropSpec(
+            mode=CropMode(self.crop_mode),
+            left=self.crop_left,
+            top=self.crop_top,
+            right=self.crop_right,
+            bottom=self.crop_bottom,
+            aspect_w=self.crop_aspect_w,
+            aspect_h=self.crop_aspect_h,
+        )
 
     def preset_enum(self) -> Preset:
         return Preset(self.preset)
@@ -83,7 +103,26 @@ def settings_from_dict(data: dict) -> AppSettings:
     output_dir = data.get("output_dir")
     kwargs["output_dir"] = output_dir if isinstance(output_dir, str) else defaults.output_dir
 
+    crop_mode = data.get("crop_mode")
+    kwargs["crop_mode"] = crop_mode if _is_valid_crop_mode(crop_mode) else defaults.crop_mode
+
+    for name in ("crop_left", "crop_top", "crop_right", "crop_bottom"):
+        value = data.get(name)
+        kwargs[name] = value if _is_int_in_range(value, 0, MAX_CROP_MARGIN) else getattr(defaults, name)
+
+    for name in ("crop_aspect_w", "crop_aspect_h"):
+        value = data.get(name)
+        kwargs[name] = value if _is_int_in_range(value, 1, MAX_ASPECT_TERM) else getattr(defaults, name)
+
     return AppSettings(**kwargs)
+
+
+def _is_valid_crop_mode(value: object) -> bool:
+    return isinstance(value, str) and value in {m.value for m in CropMode}
+
+
+def _is_int_in_range(value: object, low: int, high: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
 def _is_valid_preset(value: object) -> bool:
